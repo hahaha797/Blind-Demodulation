@@ -1,88 +1,112 @@
-# 调制信号深度学习数据集说明
+# 调制识别数据集构造工具
 
-## 数据集概述
-- **名称**：调制信号数据集（Modulation Signal Dataset）
-- **创建日期**：{pd.Timestamp.now().strftime('%Y-%m-%d')}
-- **数据来源**：原始.bin和.wav格式调制信号文件
-- **用途**：调制识别任务的深度学习模型训练、验证与测试
+该工具用于将原始IQ数据文件（.bin/.wav格式）批量解析、处理并转换为适用于机器学习训练的结构化数据集，自动完成样本划分、元数据记录和标准化输出，避免训练阶段重复处理原始数据。
 
-## 数据集结构
-{OUTPUT_DIR}/
-├── X_train.npy # 训练集特征（int16 格式）
-├── X_val.npy # 验证集特征
-├── X_test.npy # 测试集特征
-├── y_train.npy # 训练集标签（整数编码）
-├── y_val.npy # 验证集标签
-├── y_test.npy # 测试集标签
-├── label_mapping.json # 调制类型→整数标签映射表
-├── metadata.csv # 样本元数据（文件名、采样率等）
-└── README.md # 本说明文档
+## 目录
+- [环境依赖](#环境依赖)
+- [配置说明](#配置说明)
+- [使用方法](#使用方法)
+- [输出文件说明](#输出文件说明)
+- [原始数据格式要求](#原始数据格式要求)
+- [注意事项](#注意事项)
 
-## 数据格式说明
-### 1. 特征格式
-- **数据类型**：numpy.ndarray（int16，取值范围：[-32768, 32767]）
-- **形状**：(样本数, {feature_shape[0]}, {feature_shape[1]})
-  - 维度1：样本数量（训练/验证/测试集分别独立）
-  - 维度2：序列长度（每个样本含 {feature_shape[0]} 对IQ数据）
-  - 维度3：信号通道（0=I路信号，1=Q路信号）
+## 环境依赖
+确保安装以下Python包（建议使用Python 3.7+）：
+```bash
+pip install numpy pandas scikit-learn tqdm
+```
 
-### 2. 标签格式
-- **编码方式**：整数编码（LabelEncoder）
-- **标签映射表**：
-"""
-    # 添加标签映射详情
-    for mod, idx in sorted(label_mapping.items(), key=lambda x: x[1]):
-        count = class_counts.get(mod, 0)
-        readme_content += f"  - {idx} → {mod}（样本数：{count}）\n"
+## 配置说明
+脚本中`Config`类为核心配置区域，仅需修改该部分即可适配你的数据场景：
 
-    readme_content += f"""
-## 数据集统计信息
-### 1. 样本分布
-- **总样本数**：{total_samples}
-- **训练集**：{len(X_train)} 样本（{len(X_train)/total_samples*100:.1f}%）
-- **验证集**：{len(X_val)} 样本（{len(X_val)/total_samples*100:.1f}%）
-- **测试集**：{len(X_test)} 样本（{len(X_test)/total_samples*100:.1f}%）
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `DATA_DIR` | 字符串 | `../../DataSet` | 原始IQ数据文件（.bin/.wav）所在目录 |
+| `DATASET_OUTPUT_DIR` | 字符串 | `./modulation_dataset` | 生成的数据集输出目录（自动创建） |
+| `SAMPLE_LENGTH` | 整数 | 4096 | 单个样本的IQ数据对长度（I/Q各占1维，总长度为该值） |
+| `TEST_SIZE` | 浮点数 | 0.1 | 测试集占总样本的比例（最终测试集约占10%） |
+| `VAL_SIZE` | 浮点数 | 0.111 | 验证集占「训练+验证集」的比例（最终验证集约占总样本10%） |
+| `RANDOM_STATE` | 整数 | 42 | 数据集划分随机种子（保证结果可复现） |
+| `TRAIN_SAMPLE_LIMIT` | 整数 | 10000 | （可选）快速测试用：训练集最大样本数（跑通后注释） |
+| `VAL_SAMPLE_LIMIT` | 整数 | 1000 | （可选）快速测试用：验证集最大样本数（跑通后注释） |
+| `TEST_SAMPLE_LIMIT` | 整数 | 1000 | （可选）快速测试用：测试集最大样本数（跑通后注释） |
 
-### 2. 类别分布
-| 调制类型 | 样本数 | 占比 |
-|----------|--------|------|
-"""
-    for mod, count in class_counts.items():
-        readme_content += f"| {mod} | {count} | {count/total_samples*100:.1f}% |\n"
+## 使用方法
 
-    readme_content += f"""
-### 3. 采样率分布
-- 包含采样率：{sample_rate_str}
-- 说明：采样率为原始文件属性，未做统一归一化，详情见metadata.csv
+### 1. 配置参数
+修改脚本中`Config`类的参数，核心确认：
+- `DATA_DIR`：指向你的原始IQ数据文件目录（确保目录下仅包含.bin/.wav文件）
+- `SAMPLE_LENGTH`：根据模型输入要求调整单样本IQ长度
+- （可选）注释/取消注释「快速测试采样」配置（首次跑通建议保留，正式生成注释）
 
-## 数据预处理规则
-### 1. 原始文件读取
-- **.bin文件**：无数据头，按每 {SAMPLE_LENGTH} 对IQ分割为帧（样本），帧间不连续
-- **.wav文件**：跳过1068字节头部，按 {SAMPLE_LENGTH} 对IQ分割样本，全文件连续
-- 不足 {SAMPLE_LENGTH} 对IQ的数据片段直接丢弃，保证样本长度统一
+### 2. 运行脚本
+```bash
+python dataset_builder.py  # 替换为你的脚本实际文件名
+```
+运行过程中会输出：
+- 每个文件的处理进度及生成的样本数
+- 数据集划分和npy文件生成进度（带进度条）
+- 最终生成文件列表
 
-### 2. 数据集划分
-- 采用**分层抽样**：保证每个调制类型在训练/验证/测试集中的比例一致
-- 划分比例：训练集70% → 验证集10% → 测试集20%
-- 随机种子：{RANDOM_STATE}（可复现划分结果）
-
-## 快速使用示例
-# ```python```
-
+### 3. 后续训练
+生成数据集后，训练脚本（如`trainer.py`）可直接加载`DATASET_OUTPUT_DIR`下的npy文件，无需再处理原始.bin/.wav文件：
+```python
+# 示例：加载训练集
 import numpy as np
-import json
 
-# 加载数据
-X_train = np.load('{OUTPUT_DIR}/X_train.npy')
-y_train = np.load('{OUTPUT_DIR}/y_train.npy')
-X_test = np.load('{OUTPUT_DIR}/X_test.npy')
-y_test = np.load('{OUTPUT_DIR}/y_test.npy')
+train_data = np.load("./modulation_dataset/train_data.npy")
+train_labels = np.load("./modulation_dataset/train_labels.npy")
+```
 
-# 加载标签映射
-with open('{OUTPUT_DIR}/label_mapping.json', 'r') as f:
-    label_mapping = json.load(f)
-reverse_mapping = {{v: k for k, v in label_mapping.items()}}
+## 输出文件说明
+脚本运行完成后，在`DATASET_OUTPUT_DIR`目录下生成以下文件：
 
-# 查看数据信息
-print(f"训练集特征形状：{{X_train.shape}}")  # (样本数, 131072, 2)
-print(f"第一个样本标签：{{reverse_mapping[y_train[0]]}}")  # 调制类型名称
+| 文件名 | 格式 | 说明 |
+|--------|------|------|
+| `file_metadata.csv` | CSV | 原始文件元数据，包含每个文件的路径、类型、调制方式、采样率、有效IQ对数量、生成样本数等 |
+| `global_sample_mapping.csv` | CSV | 全局样本映射表，记录每个样本对应的原始文件路径、IQ起始索引、调制方式 |
+| `label_mapping.json` | JSON | 标签编码映射：<br>- `label_to_idx`：调制方式→数字标签<br>- `idx_to_label`：数字标签→调制方式<br>- `total_samples`：总样本数 |
+| `train_data.npy` | NPY | 训练集IQ数据，shape为`[样本数, 2, SAMPLE_LENGTH]`（2对应I/Q通道） |
+| `train_labels.npy` | NPY | 训练集标签（数字编码） |
+| `val_data.npy` | NPY | 验证集IQ数据，shape同训练集 |
+| `val_labels.npy` | NPY | 验证集标签（数字编码） |
+| `test_data.npy` | NPY | 测试集IQ数据，shape同训练集 |
+| `test_labels.npy` | NPY | 测试集标签（数字编码） |
+
+## 原始数据格式要求
+### 支持的文件类型
+#### 1. .bin文件
+- 数据存储：int16类型，I/Q交替存储（I在前，Q在后）
+- 帧结构：每帧包含131072个IQ对，仅处理完整帧（不处理最后不完整帧）
+- 数据读取：按帧解析，每帧内滑动生成样本（步长1）
+
+#### 2. .wav文件
+- 数据偏移：文件头占1068字节，从1068字节开始为IQ数据
+- 数据存储：int16类型，I/Q交替存储
+- 数据读取：无帧结构，直接滑动生成样本（步长1）
+
+### 文件名命名规则
+文件名需包含**调制方式**和**采样率**信息，示例：
+- 合法：`QPSK_10MSPS_20250101.bin`、`FSK_20kSPS_test.wav`、`16QAM_5.2MSPS_001.bin`
+- 解析规则：<br>
+  - 调制方式：文件名下划线分割后的第一个字段<br>
+  - 采样率：匹配`数字+[kM]SPS`格式（如10MSPS=10MHz，20kSPS=20kHz）
+
+## 注意事项
+1. 脚本仅需运行一次：生成npy数据集后，训练阶段直接使用npy文件，避免重复解析原始数据
+2. 编码兼容：脚本输出的CSV/JSON文件均采用UTF-8编码，支持中文文件名/调制方式
+3. 数据归一化：原始int16类型IQ数据会被归一化到`[-1.0, 1.0]`（除以32767.0）
+4. 分层划分：数据集划分采用分层策略，保证训练/验证/测试集中各调制方式的分布比例一致
+5. 路径兼容：自动处理Windows/Linux路径分隔符（`/`和`\`）
+6. 容错处理：处理失败的文件会输出错误信息并跳过，不影响整体流程
+7. 数据长度：若.wav文件的IQ对总数小于`SAMPLE_LENGTH`，会跳过该文件（无有效样本）
+
+## 常见问题
+### Q1: 运行时提示文件不存在？
+A1: 检查`DATA_DIR`配置是否正确，或原始文件路径是否包含特殊字符（建议使用纯英文路径）。
+
+### Q2: 生成的样本数为0？
+A2: 确认原始文件的IQ对总数≥`SAMPLE_LENGTH`，且文件名符合命名规则（包含调制方式和采样率）。
+
+### Q3: 内存不足？
+A3: 启用「快速测试采样」配置（`TRAIN_SAMPLE_LIMIT`等），或减小`SAMPLE_LENGTH`，或分批处理原始文件。
