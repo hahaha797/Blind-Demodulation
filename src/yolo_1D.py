@@ -8,36 +8,42 @@ from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import warnings
+
 warnings.filterwarnings('ignore')
 
-# ===================== 配置（仅修改此处） =====================
+# ===================== 配置 =====================
 class Config:
-    DATASET_OUTPUT_DIR = "./modulation_dataset"  # 程序1的输出目录
+    DATASET_OUTPUT_DIR = "./modulation_dataset"
     BATCH_SIZE = 8  # 8GB显存适配
-    EPOCHS = 5      # 测试用，稳定后改50
+    EPOCHS = 5
     LR = 1e-4
     WEIGHT_DECAY = 1e-5
     ACCUMULATION_STEPS = 4
-    NUM_CLASSES = 20  # 和程序1生成的调制类型数一致
+    # 自动读取调制类型数
+    NUM_CLASSES = len(json.load(open(os.path.join(DATASET_OUTPUT_DIR, "label_mapping.json")))['label_to_idx'])
 
 config = Config()
 
-# ===================== 数据集类（仅读npy） =====================
-class NpyDataset(Dataset):
+# ===================== 流式数据集加载类 =====================
+class StreamNpyDataset(Dataset):
+    """兼容流式生成的npy数据集"""
     def __init__(self, split='train'):
-        self.data = np.load(os.path.join(config.DATASET_OUTPUT_DIR, f"{split}_data.npy"))
-        self.labels = np.load(os.path.join(config.DATASET_OUTPUT_DIR, f"{split}_labels.npy"))
-        print(f"✅ 加载{split}集：{len(self.data)}个样本（纯npy）")
+        self.data_path = os.path.join(config.DATASET_OUTPUT_DIR, f"{split}_data.npy")
+        self.labels_path = os.path.join(config.DATASET_OUTPUT_DIR, f"{split}_labels.npy")
+        # 内存映射加载（避免一次性加载大文件）
+        self.data = np.load(self.data_path, mmap_mode='r')
+        self.labels = np.load(self.labels_path, mmap_mode='r')
+        print(f"✅ 加载{split}集：{len(self.data)}个样本（内存映射模式）")
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
+        # 按需读取，不缓存
         return torch.from_numpy(self.data[idx]).float(), torch.tensor(self.labels[idx], dtype=torch.long)
 
 # ===================== 模型定义 =====================
 class Swish(nn.Module):
-    """低版本PyTorch兼容SiLU"""
     def forward(self, x):
         return x * torch.sigmoid(x)
 
@@ -45,8 +51,7 @@ def get_activation():
     return nn.SiLU() if hasattr(nn, 'SiLU') else Swish()
 
 class YOLO12_1D_Classifier(nn.Module):
-    """轻量化YOLO12-1D模型"""
-    def __init__(self, num_classes=20):
+    def __init__(self, num_classes):
         super().__init__()
         self.backbone = nn.Sequential(
             nn.Conv1d(2, 16, 6, 2, 3, bias=False),
@@ -74,7 +79,6 @@ class YOLO12_1D_Classifier(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(64, num_classes)
         )
-        # 权重初始化
         self.apply(lambda m: nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
                    if isinstance(m, (nn.Conv1d, nn.Linear)) else None)
         self.to('cuda')
@@ -84,30 +88,28 @@ class YOLO12_1D_Classifier(nn.Module):
 
 # ===================== 训练函数 =====================
 def train_model():
-    """主训练函数"""
     print("\n" + "=" * 80)
-    print("🚀 开始训练（仅读取npy数据集）")
+    print("🚀 开始训练（兼容流式数据集）")
     print("=" * 80)
 
-    # 校验npy文件
-    required_npy = ["train_data.npy", "train_labels.npy", "val_data.npy", "val_labels.npy", "test_data.npy", "test_labels.npy"]
-    for f in required_npy:
-        file_path = os.path.join(config.DATASET_OUTPUT_DIR, f)
-        assert os.path.exists(file_path), f"❌ 找不到{f}！请先运行dataset_constructor.py"
+    # 校验数据集
+    required_files = [f"{split}_data.npy" for split in ['train', 'val', 'test']] + \
+                     [f"{split}_labels.npy" for split in ['train', 'val', 'test']]
+    for f in required_files:
+        assert os.path.exists(os.path.join(config.DATASET_OUTPUT_DIR, f)), f"❌ 找不到{f}！请先运行dataset_constructor.py"
 
     # Windows适配
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     torch.backends.cudnn.benchmark = True
-    torch.multiprocessing.set_sharing_strategy('file_system')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"📌 设备：{device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
 
-    # 加载数据集
-    train_dataset = NpyDataset('train')
-    val_dataset = NpyDataset('val')
-    test_dataset = NpyDataset('test')
+    # 加载数据集（内存映射模式）
+    train_dataset = StreamNpyDataset('train')
+    val_dataset = StreamNpyDataset('val')
+    test_dataset = StreamNpyDataset('test')
 
-    # DataLoader
+    # DataLoader（多进程关闭，避免内存映射冲突）
     train_loader = DataLoader(
         train_dataset, batch_size=config.BATCH_SIZE, shuffle=True,
         num_workers=0, pin_memory=False, drop_last=True
