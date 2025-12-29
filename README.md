@@ -1,6 +1,6 @@
-# 调制识别YOLO12-1D模型训练脚本
+# 调制识别BIDE-V1-1D模型训练脚本
 
-该脚本基于PyTorch实现轻量化YOLO12-1D模型的训练流程，专用于调制识别任务，仅读取前序数据集构造脚本生成的npy格式数据，支持混合精度训练、梯度累积、学习率调度等优化策略，适配GPU训练场景。
+该脚本基于PyTorch实现轻量化BIDE-V1-1D模型的训练流程，专用于调制识别任务，仅读取前序数据集构造脚本生成的npy格式数据，支持混合精度训练、梯度累积、学习率调度等优化策略，适配GPU训练场景。
 
 ## 目录
 - [概述](#概述)
@@ -16,7 +16,7 @@
 ## 概述
 本脚本核心功能：
 - 仅加载npy格式的结构化数据集（避免重复解析原始IQ文件）
-- 实现轻量化1D卷积模型（YOLO12-1D）的构建与训练
+- 实现轻量化1D卷积模型（BIDE-V1-1D）的构建与训练
 - 支持混合精度训练、梯度累积、学习率余弦退火调度
 - 自动保存最优验证精度模型，并在训练结束后测试模型性能
 - 实时监控训练损失、准确率、GPU显存使用情况
@@ -74,10 +74,10 @@ python trainer.py  # 替换为你的脚本实际文件名
 
 ### 3. 训练结果
 训练完成后，在`DATASET_OUTPUT_DIR`目录下生成：
-- `yolo12_1d_best.pth`：最优验证精度模型权重（包含模型参数、优化器状态、最优准确率）
+- `BIDE-V1_1d_best.pth`：最优验证精度模型权重（包含模型参数、优化器状态、最优准确率）
 
 ## 模型架构说明
-### YOLO12_1D_Classifier 结构
+### BIDE-V1_1D_Classifier 结构
 | 模块 | 说明 |
 |------|------|
 | Backbone（特征提取） | 5层1D卷积堆叠：<br>- 输入：2通道（I/Q）×4096长度<br>- 卷积核：6/3，步长2，逐层下采样<br>- 激活：SiLU/Swish（低版本PyTorch兼容）<br>- 归一化：BatchNorm1d |
@@ -93,7 +93,7 @@ python trainer.py  # 替换为你的脚本实际文件名
 2. **设备初始化**：优先使用CUDA，启用cudnn加速，适配Windows系统路径策略
 3. **数据集加载**：通过`NpyDataset`类加载npy数据，转换为PyTorch张量
 4. **DataLoader构建**：训练集打乱，验证/测试集不打乱，批次大小适配
-5. **模型初始化**：构建YOLO12-1D模型，加载至GPU，初始化损失函数/优化器/调度器
+5. **模型初始化**：构建BIDE-V1-1D模型，加载至GPU，初始化损失函数/优化器/调度器
 6. **训练循环**：
    - 训练阶段：混合精度训练 + 梯度累积，每10批次清理GPU显存
    - 验证阶段：每轮训练后评估验证集，计算损失和准确率
@@ -136,7 +136,7 @@ A4: 脚本已内置Swish类兼容低版本PyTorch，无需额外修改，自动�
 ### Q5: 模型保存后加载失败？
 A5: 确保加载时的模型结构与训练时一致（尤其是`NUM_CLASSES`），加载代码示例：
 ```python
-model = YOLO12_1D_Classifier(num_classes=20)
-checkpoint = torch.load("yolo12_1d_best.pth")
+model = BIDE-V1_1D_Classifier(num_classes=20)
+checkpoint = torch.load("BIDE-V1_1d_best.pth")
 model.load_state_dict(checkpoint['model_state_dict'])
 ```
