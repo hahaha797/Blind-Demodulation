@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,301 +9,337 @@ from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import warnings
+import psutil
+from datetime import datetime
 
 warnings.filterwarnings('ignore')
 
 
-# ===================== 配置（仅修改此处） =====================
+#
+
+# ===================== 配置（适配 Float16 + 48G内存） =====================
 class Config:
-    DATASET_OUTPUT_DIR = "./modulation_dataset"  # 数据集构造程序输出目录
-    BATCH_SIZE = 8  # 8GB显存适配（12GB可设16，24GB可设32）
-    EPOCHS = 5  # 测试用，千万级样本建议正式训练设50-100
-    LR = 1e-4  # 千万级样本建议学习率1e-4~5e-5
-    WEIGHT_DECAY = 1e-5  # 防止过拟合
-    ACCUMULATION_STEPS = 4  # 梯度累积，等效增大批次（48G内存建议4-8）
-    # 自动从label_mapping.json读取类别数，无需手动设置
-    NUM_CLASSES = None
+    # 1. 路径修改：指向生成的新数据集目录
+    DATASET_OUTPUT_DIR = "./modulation_dataset_50overlap"
+    LOG_DIR = "./train_logs"
+
+    # 2. 性能参数优化
+    # 由于数据是Float16，内存占用减半，可以将Batch Size增大一倍
+    BATCH_SIZE = 64  # 48G显存推荐64-128 (取决于模型大小)
+
+    EPOCHS = 50  # 正式训练轮数
+    LR = 3e-4  # 初始学习率 (AdamW)
+    WEIGHT_DECAY = 1e-4
+
+    # 梯度累积：Batch=64 * Accum=4 => 等效 Batch=256
+    ACCUMULATION_STEPS = 4
+    WARMUP_EPOCHS = 3
+
+    # 3. 自动参数（后续从json读取）
+    NUM_CLASSES = 0
+    SAMPLE_LENGTH = 4096
+
+    # 资源保护
+    SAVE_INTERVAL = 5
+    MAX_GPU_MEM_RATIO = 0.90
 
 
 config = Config()
 
+# 创建日志目录
+os.makedirs(config.LOG_DIR, exist_ok=True)
 
-# ===================== 数据集类（适配千万级样本+48G内存） =====================
-class LargeNpyDataset(Dataset):
-    """
-    内存映射模式加载大npy文件，避免一次性加载到内存
-    适配千万级样本、48G内存场景，仅按需读取样本
-    """
 
+# ===================== 工具函数 =====================
+def log_info(msg, save_to_file=True):
+    """打印并保存日志"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_msg = f"[{timestamp}] {msg}"
+    print(log_msg)
+    if save_to_file:
+        log_path = os.path.join(config.LOG_DIR, "train_log.txt")
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(log_msg + "\n")
+
+
+def monitor_resources():
+    """资源监控"""
+    mem_info = "CPU"
+    if torch.cuda.is_available():
+        mem_alloc = torch.cuda.memory_allocated(0) / 1024 ** 3
+        mem_res = torch.cuda.memory_reserved(0) / 1024 ** 3
+        mem_info = f"GPU: {mem_alloc:.1f}/{mem_res:.1f}GB"
+
+    ram_used = psutil.virtual_memory().percent
+    return f"{mem_info} | RAM: {ram_used}%"
+
+
+# ===================== 数据集类（适配 Float16 NPY） =====================
+class ModulationDataset(Dataset):
     def __init__(self, split='train'):
         self.split = split
         self.data_path = os.path.join(config.DATASET_OUTPUT_DIR, f"{split}_data.npy")
         self.labels_path = os.path.join(config.DATASET_OUTPUT_DIR, f"{split}_labels.npy")
 
-        # 内存映射模式加载（核心优化：不占物理内存）
-        self.data = np.load(self.data_path, mmap_mode='r')
-        self.labels = np.load(self.labels_path, mmap_mode='r')
+        if not os.path.exists(self.data_path):
+            raise FileNotFoundError(f"❌ {split}集文件缺失：{self.data_path}")
 
-        # 打印数据集信息（适配你的12类调制信号）
-        self.num_samples = len(self.data)
-        self.unique_labels = np.unique(self.labels[:10000])  # 采样统计类别数
-        print(f"✅ 加载{split}集：{self.num_samples:,}个样本 | 检测到{len(self.unique_labels)}类调制信号")
+        # === 核心优化：内存映射 ===
+        # mmap_mode='r' 意味着数据保留在硬盘上，随用随取，不占用几十G的内存
+        try:
+            self.data = np.load(self.data_path, mmap_mode='r')
+            self.labels = np.load(self.labels_path, mmap_mode='r')
+        except Exception as e:
+            raise RuntimeError(f"❌ 加载{split}集失败：{e}")
+
+        self.num_samples = len(self.labels)
+
+        # 校验形状 [N, 2, L]
+        if len(self.data.shape) != 3 or self.data.shape[1] != 2:
+            log_info(f"⚠️ {split}集形状警告: {self.data.shape}, 预期 [N, 2, 4096]")
+
+        log_info(f"✅ Loaded {split}: {self.num_samples:,} samples | Shape: {self.data.shape}")
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        # 按需读取单样本，避免内存溢出
         try:
-            data = torch.from_numpy(self.data[idx]).float()
-            label = torch.tensor(self.labels[idx], dtype=torch.long)
-            return data, label
+            # === 核心适配：Float16 -> Float32 ===
+            # 1. 从 mmap 读取 (Float16)
+            # 2. astype(np.float32) 会将数据复制到内存并转换类型
+            #    这是必要的，因为后续卷积层通常需要 float32 输入
+            sample_np = self.data[idx].astype(np.float32)
+            label_val = self.labels[idx]
+
+            # 3. 转为 Tensor
+            data_tensor = torch.from_numpy(sample_np)
+            label_tensor = torch.tensor(label_val, dtype=torch.long)
+
+            return data_tensor, label_tensor
+
         except Exception as e:
-            # 容错：样本读取失败时返回空样本（避免训练中断）
-            print(f"⚠️  读取{self.split}集样本{idx}失败：{e}")
-            return torch.zeros(2, config.SAMPLE_LENGTH).float(), torch.tensor(0, dtype=torch.long)
+            # 容错处理
+            return torch.zeros(2, config.SAMPLE_LENGTH).float(), torch.tensor(0).long()
 
 
-# ===================== 模型定义（兼容12类调制信号） =====================
+# ===================== 模型定义 (YOLO12-1D) =====================
 class Swish(nn.Module):
-    """低版本PyTorch兼容SiLU"""
-
-    def forward(self, x):
-        return x * torch.sigmoid(x)
+    def forward(self, x): return x * torch.sigmoid(x)
 
 
 def get_activation():
     return nn.SiLU() if hasattr(nn, 'SiLU') else Swish()
 
 
-class YOLO12_1D_Classifier(nn.Module):
-    """轻量化YOLO12-1D模型（适配12类调制信号分类）"""
-
-    def __init__(self, num_classes=12):
+class YOLO12_1D_Modulation(nn.Module):
+    def __init__(self, num_classes):
         super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Conv1d(2, 16, 6, 2, 3, bias=False),  # 输入：2通道（I/Q），4096长度
-            nn.BatchNorm1d(16),
-            get_activation(),
-            nn.Conv1d(16, 32, 3, 2, 1, bias=False),
-            nn.BatchNorm1d(32),
-            get_activation(),
-            nn.Conv1d(32, 64, 3, 2, 1, bias=False),
-            nn.BatchNorm1d(64),
-            get_activation(),
-            nn.Conv1d(64, 128, 3, 2, 1, bias=False),
-            nn.BatchNorm1d(128),
-            get_activation(),
-            nn.Conv1d(128, 128, 3, 2, 1, bias=False),
-            nn.BatchNorm1d(128),
-            get_activation(),
+
+        # Backbone: Input [B, 2, 4096]
+        # 结构未变，但输入数据现在是精准的 Float32 (由Dataset类转换而来)
+        self.features = nn.Sequential(
+            # Stage 1
+            nn.Conv1d(2, 32, 7, stride=2, padding=3, bias=False),  # -> 2048
+            nn.BatchNorm1d(32), get_activation(),
+
+            # Stage 2
+            nn.Conv1d(32, 64, 5, stride=2, padding=2, bias=False),  # -> 1024
+            nn.BatchNorm1d(64), get_activation(),
+            nn.Dropout1d(0.1),
+
+            # Stage 3
+            nn.Conv1d(64, 128, 3, stride=2, padding=1, bias=False),  # -> 512
+            nn.BatchNorm1d(128), get_activation(),
+
+            # Stage 4
+            nn.Conv1d(128, 256, 3, stride=2, padding=1, bias=False),  # -> 256
+            nn.BatchNorm1d(256), get_activation(),
+
+            # Stage 5
+            nn.Conv1d(256, 512, 3, stride=2, padding=1, bias=False),  # -> 128
+            nn.BatchNorm1d(512), get_activation(),
+
+            # Stage 6 (Global Context)
+            nn.Conv1d(512, 512, 3, stride=2, padding=1, bias=False),  # -> 64
+            nn.BatchNorm1d(512), get_activation(),
         )
-        self.class_head = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),  # 适配任意长度输入
+
+        # Head
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
             get_activation(),
-            nn.Dropout(0.1),  # 千万级样本建议dropout 0.1-0.2
-            nn.Linear(64, num_classes)
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
         )
-        # 权重初始化（适配分类任务）
-        self.apply(lambda m: nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
-        if isinstance(m, (nn.Conv1d, nn.Linear)) else None)
-        # 自动适配设备（GPU/CPU）
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.to(self.device)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        return self.class_head(self.backbone(x.to(self.device)))
+        x = self.features(x)
+        x = self.avgpool(x)
+        return self.classifier(x)
 
 
-# ===================== 训练函数（适配千万级样本） =====================
+# ===================== 训练主流程 =====================
 def train_model():
-    """主训练函数：适配12类调制信号、千万级样本、48G内存"""
-    print("\n" + "=" * 80)
-    print("🚀 开始训练（适配千万级调制信号数据集）")
-    print("=" * 80)
+    log_info("=" * 60)
+    log_info("🚀 开始训练 (适配 Float16 数据集)")
+    log_info("=" * 60)
 
-    # -------------------------- 1. 初始化配置（自动适配你的数据集） --------------------------
-    # 自动读取样本长度（从file_metadata.csv或label_mapping.json）
-    try:
-        label_mapping_path = os.path.join(config.DATASET_OUTPUT_DIR, "label_mapping.json")
-        with open(label_mapping_path, 'r', encoding='utf-8') as f:
-            label_mapping = json.load(f)
-        config.NUM_CLASSES = len(label_mapping['label_to_idx'])
-        config.SAMPLE_LENGTH = 4096  # 你的数据集固定4096长度
-        print(f"📌 自动识别：{config.NUM_CLASSES}类调制信号 | 单样本长度{config.SAMPLE_LENGTH}")
-    except Exception as e:
-        print(f"⚠️  读取标签映射失败，使用默认12类：{e}")
-        config.NUM_CLASSES = 12
-        config.SAMPLE_LENGTH = 4096
-
-    # 校验数据集文件（适配你的流式生成结果）
-    required_npy = [
-        "train_data.npy", "train_labels.npy",
-        "val_data.npy", "val_labels.npy",
-        "test_data.npy", "test_labels.npy"
-    ]
-    missing_files = []
-    for f in required_npy:
-        file_path = os.path.join(config.DATASET_OUTPUT_DIR, f)
-        if not os.path.exists(file_path):
-            missing_files.append(f)
-    if missing_files:
-        raise FileNotFoundError(f"❌ 缺失数据集文件：{missing_files}，请先运行dataset_constructor.py")
-
-    # -------------------------- 2. 设备适配（Windows+48G内存） --------------------------
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"  # 显存分片，避免OOM
-    torch.backends.cudnn.benchmark = True  # 加速训练
-    torch.multiprocessing.set_sharing_strategy('file_system')  # Windows内存映射兼容
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"📌 训练设备：{device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
-    if not torch.cuda.is_available():
-        print("⚠️  未检测到GPU，将使用CPU训练（千万级样本CPU训练极慢）")
+    log_info(f"Using device: {device}")
 
-    # -------------------------- 3. 加载数据集（内存映射模式） --------------------------
-    print("\n📌 加载数据集（内存映射模式，48G内存友好）")
-    train_dataset = LargeNpyDataset('train')
-    val_dataset = LargeNpyDataset('val')
-    test_dataset = LargeNpyDataset('test')
+    # 1. 自动读取 Label Mapping 获取类别配置
+    json_path = os.path.join(config.DATASET_OUTPUT_DIR, "label_mapping.json")
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                mapping = json.load(f)
+                # 兼容两种json格式（之前代码生成的和直接字典的）
+                if 'label_to_idx' in mapping:  # 旧格式
+                    config.NUM_CLASSES = len(mapping['label_to_idx'])
+                elif isinstance(mapping, dict):  # 新格式 (直接是字典)
+                    config.NUM_CLASSES = len(mapping)
+            log_info(f"📌 自动检测类别数: {config.NUM_CLASSES}")
+        except Exception as e:
+            log_info(f"⚠️ 读取json失败: {e}, 默认使用20类")
+            config.NUM_CLASSES = 20
+    else:
+        log_info("⚠️ 未找到 label_mapping.json，默认使用20类")
+        config.NUM_CLASSES = 20
 
-    # DataLoader（适配千万级样本，关闭多进程避免内存冲突）
-    train_loader = DataLoader(
-        train_dataset, batch_size=config.BATCH_SIZE, shuffle=True,
-        num_workers=0, pin_memory=False, drop_last=True,  # num_workers=0适配Windows
-        prefetch_factor=None  # 关闭预取，减少内存占用
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=config.BATCH_SIZE * 2, shuffle=False,
-        num_workers=0, pin_memory=False
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=config.BATCH_SIZE * 2, shuffle=False,
-        num_workers=0, pin_memory=False
+    # 2. 数据集加载
+    train_ds = ModulationDataset('train')
+    val_ds = ModulationDataset('val')
+    test_ds = ModulationDataset('test')
+
+    # Windows下 num_workers 必须设为 0，否则 mmap 文件句柄会报错
+    num_workers = 0 if os.name == 'nt' else 4
+
+    train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, shuffle=True,
+                              num_workers=num_workers, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE * 2, shuffle=False,
+                            num_workers=num_workers, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=config.BATCH_SIZE * 2, shuffle=False,
+                             num_workers=num_workers, pin_memory=True)
+
+    # 3. 模型初始化
+    model = YOLO12_1D_Modulation(num_classes=config.NUM_CLASSES).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LR, weight_decay=config.WEIGHT_DECAY)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    # 学习率策略 (OneCycle 效果通常最好)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=config.LR,
+        steps_per_epoch=len(train_loader) // config.ACCUMULATION_STEPS,
+        epochs=config.EPOCHS, pct_start=0.1
     )
 
-    # -------------------------- 4. 模型/优化器初始化 --------------------------
-    model = YOLO12_1D_Classifier(num_classes=config.NUM_CLASSES)
-    criterion = nn.CrossEntropyLoss().to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.LR,
-        weight_decay=config.WEIGHT_DECAY,
-        eps=1e-8  # 适配千万级样本优化
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.EPOCHS, eta_min=1e-6  # 学习率余弦衰减
-    )
-    scaler = GradScaler()  # 混合精度训练，节省显存
+    scaler = GradScaler()  # 混合精度训练工具
 
-    # -------------------------- 5. 训练循环（适配千万级样本） --------------------------
-    best_val_acc = 0.0
-    print(f"\n📌 开始训练：{config.EPOCHS}轮 | 批次大小{config.BATCH_SIZE} | 梯度累积{config.ACCUMULATION_STEPS}")
+    # 4. 训练循环
+    best_acc = 0.0
 
     for epoch in range(config.EPOCHS):
-        # 训练阶段
         model.train()
-        train_loss, train_acc, train_total = 0.0, 0.0, 0
-        pbar = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{config.EPOCHS}] Train")
+        total_loss = 0
+        correct = 0
+        total = 0
 
         optimizer.zero_grad()
-        for batch_idx, (data, labels) in enumerate(pbar):
-            # 定期清理显存（适配千万级样本）
-            if batch_idx % 50 == 0:
-                torch.cuda.empty_cache()
 
-            # 混合精度训练（核心：减少显存占用）
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.EPOCHS}", ncols=110)
+
+        for i, (inputs, targets) in enumerate(pbar):
+            # non_blocking=True 加速数据传输
+            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+
+            # 混合精度上下文
             with autocast():
-                outputs = model(data)
-                loss = criterion(outputs, labels.to(device)) / config.ACCUMULATION_STEPS
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss = loss / config.ACCUMULATION_STEPS
 
-            # 梯度累积（等效增大批次，提升训练稳定性）
+            # 反向传播 (缩放梯度)
             scaler.scale(loss).backward()
-            if (batch_idx + 1) % config.ACCUMULATION_STEPS == 0:
+
+            # 梯度累积更新
+            if (i + 1) % config.ACCUMULATION_STEPS == 0:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                scheduler.step()
 
-            # 统计训练指标
-            train_loss += loss.item() * config.ACCUMULATION_STEPS * data.size(0)
-            train_acc += (outputs.argmax(1) == labels.to(device)).sum().item()
-            train_total += data.size(0)
+            # 统计
+            scaler_loss = loss.item() * config.ACCUMULATION_STEPS
+            total_loss += scaler_loss
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
 
-            # 实时显示显存占用
-            mem_used = torch.cuda.memory_allocated(0) / 1e9 if torch.cuda.is_available() else 0
-            pbar.set_postfix({
-                'Loss': f'{loss.item() * config.ACCUMULATION_STEPS:.4f}',
-                'Acc': f'{train_acc / train_total:.4f}',
-                'Mem': f'{mem_used:.1f}GB'
-            })
+            pbar.set_postfix({'Loss': f"{scaler_loss:.4f}", 'Acc': f"{100. * correct / total:.2f}%"})
 
-        # 验证阶段（无梯度计算）
-        model.eval()
-        val_loss, val_acc, val_total = 0.0, 0.0, 0
-        with torch.no_grad():
-            for data, labels in tqdm(val_loader, desc=f"Epoch [{epoch + 1}/{config.EPOCHS}] Val"):
-                outputs = model(data)
-                loss = criterion(outputs, labels.to(device))
-                val_loss += loss.item() * data.size(0)
-                val_acc += (outputs.argmax(1) == labels.to(device)).sum().item()
-                val_total += data.size(0)
+        # End of Epoch
+        train_acc = 100. * correct / total
+        log_info(
+            f"Epoch {epoch + 1} Train | Loss: {total_loss / len(train_loader):.4f} | Acc: {train_acc:.2f}% | {monitor_resources()}")
 
-        # 计算本轮指标
-        train_loss_avg = train_loss / train_total
-        train_acc_avg = train_acc / train_total
-        val_loss_avg = val_loss / val_total
-        val_acc_avg = val_acc / val_total
-        scheduler.step()  # 学习率衰减
+        # Validation
+        val_acc = evaluate(model, val_loader, device, criterion, "Val")
 
-        # 打印本轮结果
-        print(f"\n📊 Epoch {epoch + 1} 训练结果：")
-        print(f"  - 训练损失：{train_loss_avg:.4f} | 训练准确率：{train_acc_avg:.4f}")
-        print(f"  - 验证损失：{val_loss_avg:.4f} | 验证准确率：{val_acc_avg:.4f}")
-        print(f"  - 当前学习率：{optimizer.param_groups[0]['lr']:.6f}")
+        # Save Best
+        if val_acc > best_acc:
+            best_acc = val_acc
+            save_path = os.path.join(config.DATASET_OUTPUT_DIR, "best_model.pth")
+            torch.save(model.state_dict(), save_path)
+            log_info(f"✅ New Best Model Saved! Acc: {best_acc:.2f}%")
 
-        # 保存最优模型（按验证准确率）
-        if val_acc_avg > best_val_acc:
-            best_val_acc = val_acc_avg
-            save_path = os.path.join(config.DATASET_OUTPUT_DIR, "yolo12_1d_best.pth")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'best_val_acc': best_val_acc,
-                'num_classes': config.NUM_CLASSES,
-                'sample_length': config.SAMPLE_LENGTH
-            }, save_path)
-            print(f"✅ 保存最优模型：{save_path}（验证准确率：{best_val_acc:.4f}）")
+        # Save Checkpoint
+        if (epoch + 1) % config.SAVE_INTERVAL == 0:
+            torch.save(model.state_dict(), os.path.join(config.DATASET_OUTPUT_DIR, f"epoch_{epoch + 1}.pth"))
 
-    # -------------------------- 6. 测试阶段（加载最优模型） --------------------------
-    print("\n📌 测试阶段（加载最优模型评估）")
-    checkpoint = torch.load(os.path.join(config.DATASET_OUTPUT_DIR, "yolo12_1d_best.pth"), map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Test
+    log_info("Starting Final Test...")
+    model.load_state_dict(torch.load(os.path.join(config.DATASET_OUTPUT_DIR, "best_model.pth")))
+    evaluate(model, test_loader, device, criterion, "Test")
+
+
+def evaluate(model, loader, device, criterion, name="Val"):
     model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
 
-    test_acc, test_total = 0.0, 0
     with torch.no_grad():
-        for data, labels in tqdm(test_loader, desc="Testing"):
-            outputs = model(data)
-            test_acc += (outputs.argmax(1) == labels.to(device)).sum().item()
-            test_total += data.size(0)
-    test_acc_avg = test_acc / test_total
+        for inputs, targets in tqdm(loader, desc=name, ncols=100, leave=False):
+            inputs, targets = inputs.to(device), targets.to(device)
+            with autocast():
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
 
-    # -------------------------- 7. 最终结果输出 --------------------------
-    print("\n" + "=" * 80)
-    print("🎉 训练完成！最终结果（适配千万级调制信号数据集）：")
-    print(f"  - 最优验证准确率：{best_val_acc:.4f}")
-    print(f"  - 测试集准确率：{test_acc_avg:.4f}")
-    print(f"  - 调制类别数：{config.NUM_CLASSES}")
-    print(f"  - 最优模型路径：{os.path.join(config.DATASET_OUTPUT_DIR, 'yolo12_1d_best.pth')}")
-    print("=" * 80)
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+
+    acc = 100. * correct / total
+    log_info(f"{name} Result | Loss: {total_loss / len(loader):.4f} | Acc: {acc:.2f}%")
+    return acc
 
 
-# ===================== 运行入口 =====================
 if __name__ == "__main__":
-    # 内存保护：限制PyTorch内存占用（48G内存建议设为32G）
-    if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.8)  # 最多使用80%GPU显存
+    # Windows下防止多进程报错
+    torch.multiprocessing.freeze_support()
     train_model()
