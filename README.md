@@ -1,142 +1,200 @@
-# 调制识别BIDE-V1-1D模型训练脚本
+# 调制信号识别模型训练代码说明文档
+## 文档概述
+本文档针对**基于YOLO12-1D的调制信号识别模型训练代码**进行详细说明，该代码专为 Float16 格式的 IQ 信号数据集设计，适配 48G 大内存/GPU 环境，核心优化了内存占用、显存利用效率，支持大规模调制信号样本的高效训练。
 
-该脚本基于PyTorch实现轻量化BIDE-V1-1D模型的训练流程，专用于调制识别任务，仅读取前序数据集构造脚本生成的npy格式数据，支持混合精度训练、梯度累积、学习率调度等优化策略，适配GPU训练场景。
+### 核心适配场景
+- 数据集格式：Float16 格式的 `.npy` 文件（IQ 信号，形状 [N, 2, 4096]）；
+- 硬件环境：48G 显存 GPU + 大内存服务器/工作站；
+- 业务场景：多类调制信号（如 2FSK、16QAM、QPSK 等）的分类识别。
 
-## 目录
-- [概述](#概述)
-- [环境依赖](#环境依赖)
-- [配置说明](#配置说明)
-- [使用前提](#使用前提)
-- [使用方法](#使用方法)
-- [模型架构说明](#模型架构说明)
-- [训练流程说明](#训练流程说明)
-- [注意事项](#注意事项)
-- [常见问题](#常见问题)
+### 代码版本说明
+本文档整合了两段代码的核心逻辑，重点突出**48G 内存/GPU 适配优化**和 **Float16 数据集兼容**，修复了基础版代码的内存占用、Windows 系统兼容等问题。
 
-## 概述
-本脚本核心功能：
-- 仅加载npy格式的结构化数据集（避免重复解析原始IQ文件）
-- 实现轻量化1D卷积模型（BIDE-V1-1D）的构建与训练
-- 支持混合精度训练、梯度累积、学习率余弦退火调度
-- 自动保存最优验证精度模型，并在训练结束后测试模型性能
-- 实时监控训练损失、准确率、GPU显存使用情况
+## 一、核心配置参数详解
+代码中 `Config` 类是训练的核心配置入口，所有参数均针对 48G 内存/GPU 环境优化，参数说明如下：
 
-## 环境依赖
-### 基础依赖
-```bash
-pip install torch torchvision torchaudio numpy tqdm
-```
-### 环境要求
-- Python 3.7+
-- PyTorch 1.8+（建议1.10+，低版本需兼容SiLU激活函数）
-- CUDA 10.2+（建议GPU训练，CPU仅支持测试）
-- 显存≥8GB（默认BATCH_SIZE=8适配8GB显存）
-
-## 配置说明
-脚本中`Config`类为核心配置区域，仅需修改该部分即可适配训练需求：
-
-| 配置项 | 类型 | 默认值 | 说明 |
+| 参数名 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `DATASET_OUTPUT_DIR` | 字符串 | `./modulation_dataset` | 数据集构造脚本的输出目录（需包含npy文件） |
-| `BATCH_SIZE` | 整数 | 8 | 批次大小（8GB显存建议8，16GB可设16/32） |
-| `EPOCHS` | 整数 | 5 | 训练轮数（测试用，正式训练建议设50+） |
-| `LR` | 浮点数 | 1e-4 | 初始学习率（AdamW优化器） |
-| `WEIGHT_DECAY` | 浮点数 | 1e-5 | 权重衰减（防止过拟合） |
-| `ACCUMULATION_STEPS` | 整数 | 4 | 梯度累积步数（等效增大批次：8×4=32） |
-| `NUM_CLASSES` | 整数 | 20 | 调制类型数量（需与数据集构造脚本的标签数一致） |
+| `DATASET_OUTPUT_DIR` | 字符串 | `./modulation_dataset_50overlap` | 数据集根目录，需包含 `train_data.npy`、`val_data.npy`、`test_data.npy` 及标签文件、`label_mapping.json` |
+| `LOG_DIR` | 字符串 | `./train_logs` | 训练日志保存目录，自动生成 `train_log.txt` |
+| `BATCH_SIZE` | 整数 | 64 | 批次大小（48G 显存推荐 64-128），Float16 数据显存占用减半，可比 Float32 场景增大 1 倍 |
+| `EPOCHS` | 整数 | 50 | 训练总轮数，正式训练建议 50-100 轮 |
+| `LR` | 浮点数 | 3e-4 | AdamW 优化器初始学习率 |
+| `WEIGHT_DECAY` | 浮点数 | 1e-4 | 权重衰减系数，防止模型过拟合 |
+| `ACCUMULATION_STEPS` | 整数 | 4 | 梯度累积步数，等效批次 = `BATCH_SIZE * ACCUMULATION_STEPS`（64*4=256），显存不足时可增大该值、减小 `BATCH_SIZE` |
+| `WARMUP_EPOCHS` | 整数 | 3 | 学习率预热轮数（OneCycleLR 策略） |
+| `NUM_CLASSES` | 整数 | 0 | 自动从 `label_mapping.json` 读取，无需手动修改 |
+| `SAMPLE_LENGTH` | 整数 | 4096 | IQ 信号样本长度，需与数据集一致 |
+| `SAVE_INTERVAL` | 整数 | 5 | 模型检查点保存间隔（每 N 轮保存一次） |
+| `MAX_GPU_MEM_RATIO` | 浮点数 | 0.90 | GPU 显存最大占用比例，防止显存溢出 |
 
-## 使用前提
-1. 已运行`dataset_constructor.py`生成完整的npy数据集，确保`DATASET_OUTPUT_DIR`目录下包含以下文件：
-   - `train_data.npy` / `train_labels.npy`
-   - `val_data.npy` / `val_labels.npy`
-   - `test_data.npy` / `test_labels.npy`
-2. 确认GPU可用（脚本默认使用CUDA，无GPU需修改设备配置）
+## 二、代码模块功能说明
+### 1. 工具函数模块
+#### （1）`log_info(msg, save_to_file=True)`
+- 功能：打印训练日志并保存到文件，日志包含时间戳、训练指标等；
+- 参数：`msg` 为日志内容，`save_to_file` 控制是否保存到 `train_log.txt`；
+- 输出：控制台打印 + `LOG_DIR/train_log.txt` 文件写入。
 
-## 使用方法
+#### （2）`monitor_resources()`
+- 功能：实时监控 GPU 显存（已分配/已保留）、CPU 内存使用率；
+- 适配：仅在 CUDA 可用时显示 GPU 信息，否则显示 CPU；
+- 用途：训练过程中监控资源占用，避免显存/内存溢出。
 
-### 1. 配置参数
-修改脚本中`Config`类的参数，核心确认：
-- `DATASET_OUTPUT_DIR`：指向数据集构造脚本的输出目录
-- `BATCH_SIZE`：根据GPU显存调整（8GB设8，16GB设16）
-- `EPOCHS`：测试阶段设5，正式训练设50+
-- `NUM_CLASSES`：与实际调制类型数量一致（需匹配label_mapping.json中的类别数）
+### 2. 数据集类（`ModulationDataset`）
+核心适配 Float16 数据集和 48G 内存的关键模块，解决大规模 `.npy` 文件加载的内存占用问题。
 
-### 2. 运行训练脚本
+#### 核心特性
+| 特性 | 实现方式 | 优势 |
+|------|----------|------|
+| 内存映射加载 | `np.load(..., mmap_mode='r')` | 数据保留在硬盘，随用随取，避免几十G数据集一次性加载到内存 |
+| Float16 兼容 | `astype(np.float32)` 转换 | 适配模型 Float32 输入要求，同时保留数据集 Float16 存储的体积优势 |
+| 形状校验 | 检查数据形状为 [N, 2, 4096] | 提前发现数据集格式错误，避免训练中断 |
+| 容错处理 | 异常样本返回全零张量 + 标签0 | 单个样本加载失败不影响整体训练 |
+
+#### 关键方法
+- `__init__`：初始化时加载数据集（内存映射），校验文件存在性和形状；
+- `__len__`：返回样本总数；
+- `__getitem__`：读取单个样本，完成 Float16→Float32 转换、张量封装。
+
+### 3. 模型定义（`YOLO12_1D_Modulation`）
+轻量化 1D 卷积模型，专为 IQ 双通道信号设计，适配 4096 长度的调制信号特征提取。
+
+#### 模型结构
+| 模块 | 结构 | 输出维度（输入 [B,2,4096]） |
+|------|------|----------------------------|
+| Backbone（特征提取） | 6层 1D 卷积 + BN + 激活函数 | [B,512,64] |
+| 全局平均池化 | `AdaptiveAvgPool1d(1)` | [B,512,1] |
+| 分类头 | Flatten + 全连接 + Dropout | [B, NUM_CLASSES] |
+
+#### 激活函数适配
+- 自动选择 `nn.SiLU()`（高版本 PyTorch）或自定义 `Swish`（低版本兼容）；
+- 权重初始化：Conv1d 用 Kaiming 初始化，BN 层权重置1、偏置置0。
+
+### 4. 训练主流程（`train_model`）
+整合模型训练、验证、测试、模型保存的全流程，针对 48G 内存/GPU 优化训练效率。
+
+#### 核心步骤
+1. **设备初始化**：自动选择 CUDA/CPU，优先使用 GPU；
+2. **类别数自动读取**：从 `label_mapping.json` 读取调制类别数，兼容两种 JSON 格式；
+3. **数据加载器配置**：
+   - Windows 下 `num_workers=0`（避免多进程与内存映射冲突）；
+   - Linux 下 `num_workers=4/8`（提升加载速度）；
+   - 验证集/测试集批次大小为训练集的 2 倍（提升评估效率）；
+4. **优化器与学习率策略**：
+   - 优化器：AdamW（带权重衰减，防止过拟合）；
+   - 学习率策略：OneCycleLR（含预热，提升收敛速度）；
+5. **混合精度训练**：`GradScaler` + `autocast()`，降低显存占用，提升训练速度；
+6. **梯度累积**：按 `ACCUMULATION_STEPS` 累积梯度后更新参数，等效增大批次；
+7. **模型保存**：
+   - 保存验证集最优模型（`best_model.pth`）；
+   - 按 `SAVE_INTERVAL` 保存轮次检查点；
+8. **测试评估**：训练结束后加载最优模型，评估测试集准确率。
+
+#### 评估函数（`evaluate`）
+- 功能：模型验证/测试，计算损失和准确率；
+- 优化：`torch.no_grad()` + 混合精度，减少显存占用。
+
+## 三、关键优化点（适配48G内存/GPU）
+### 1. 内存占用优化
+- 内存映射加载数据集：避免几十G Float16 数据集占用物理内存；
+- Windows 系统兼容：`num_workers=0` 解决内存映射文件句柄冲突问题；
+- 分批次加载：仅在训练时读取当前批次数据，不缓存全量数据。
+
+### 2. 显存利用优化
+- Float16 数据集适配：存储为 Float16，加载时转为 Float32，显存占用减半；
+- 混合精度训练：`GradScaler` + `autocast()`，进一步降低显存占用；
+- 梯度累积：等效增大批次的同时，不增加单批次显存占用；
+- 合理批次大小：48G 显存设置 `BATCH_SIZE=64`，平衡训练速度和显存占用。
+
+### 3. 训练效率优化
+- OneCycleLR 学习率策略：含预热和余弦衰减，加速模型收敛；
+- 标签平滑：CrossEntropyLoss 带 `label_smoothing=0.1`，提升模型泛化能力；
+- 非阻塞数据传输：`non_blocking=True` 加速数据从 CPU 到 GPU 的传输。
+
+## 四、运行步骤
+### 1. 环境准备
+安装依赖包（建议使用 Conda 环境）：
 ```bash
-python trainer.py  # 替换为你的脚本实际文件名
+# 基础依赖
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# 其他依赖
+pip install numpy tqdm psutil
 ```
-运行过程中会输出：
-- 数据集加载验证信息
-- 每轮训练的进度条（含损失、准确率、显存使用）
-- 验证阶段结果
-- 最优模型保存提示
-- 最终测试集准确率
 
-### 3. 训练结果
-训练完成后，在`DATASET_OUTPUT_DIR`目录下生成：
-- `BIDE-V1_1d_best.pth`：最优验证精度模型权重（包含模型参数、优化器状态、最优准确率）
+### 2. 数据集准备
+- 数据集目录结构：
+  ```
+  modulation_dataset_50overlap/
+  ├── train_data.npy       # 训练集数据（Float16, [N,2,4096]）
+  ├── train_labels.npy     # 训练集标签（整数）
+  ├── val_data.npy         # 验证集数据
+  ├── val_labels.npy       # 验证集标签
+  ├── test_data.npy        # 测试集数据
+  ├── test_labels.npy      # 测试集标签
+  └── label_mapping.json   # 调制类型-标签映射（字典格式）
+  ```
+- 确认 `label_mapping.json` 格式：
+  ```json
+  {"2FSK":0, "16QAM":1, "QPSK":2, ...}
+  # 或兼容格式
+  {"label_to_idx":{"2FSK":0}, "idx_to_label":{"0":"2FSK"}, "num_classes":3}
+  ```
 
-## 模型架构说明
-### BIDE-V1_1D_Classifier 结构
-| 模块 | 说明 |
-|------|------|
-| Backbone（特征提取） | 5层1D卷积堆叠：<br>- 输入：2通道（I/Q）×4096长度<br>- 卷积核：6/3，步长2，逐层下采样<br>- 激活：SiLU/Swish（低版本PyTorch兼容）<br>- 归一化：BatchNorm1d |
-| Class Head（分类头） | - AdaptiveAvgPool1d：全局平均池化（降维至128维）<br>- Flatten：展平特征<br>- 全连接层：128→64→NUM_CLASSES<br>- 正则：LayerNorm + Dropout(0.1) |
-| 权重初始化 | 卷积/全连接层使用Kaiming正态初始化 |
-
-### 输入输出
-- 输入：`[B, 2, 4096]`（B=批次大小，2=I/Q通道，4096=IQ序列长度）
-- 输出：`[B, NUM_CLASSES]`（各类别的预测概率对数）
-
-## 训练流程说明
-1. **数据校验**：检查必需的npy文件是否存在，缺失则终止并提示
-2. **设备初始化**：优先使用CUDA，启用cudnn加速，适配Windows系统路径策略
-3. **数据集加载**：通过`NpyDataset`类加载npy数据，转换为PyTorch张量
-4. **DataLoader构建**：训练集打乱，验证/测试集不打乱，批次大小适配
-5. **模型初始化**：构建BIDE-V1-1D模型，加载至GPU，初始化损失函数/优化器/调度器
-6. **训练循环**：
-   - 训练阶段：混合精度训练 + 梯度累积，每10批次清理GPU显存
-   - 验证阶段：每轮训练后评估验证集，计算损失和准确率
-   - 模型保存：保存验证准确率最优的模型权重
-7. **测试阶段**：加载最优模型，评估测试集准确率并输出最终结果
-
-## 注意事项
-1. **显存优化**：
-   - 若显存不足，减小`BATCH_SIZE`（如设4）或增大`ACCUMULATION_STEPS`
-   - 每10批次自动清理GPU显存，避免内存泄漏
-2. **混合精度训练**：使用`GradScaler`加速训练，降低显存占用
-3. **梯度累积**：等效增大批次大小，提升训练稳定性（适合小显存场景）
-4. **学习率调度**：采用余弦退火调度，随训练轮数逐步降低学习率
-5. **设备适配**：
-   - 无GPU时，需将代码中`'cuda'`改为`'cpu'`（包括模型初始化、数据传输）
-   - Windows系统已适配CUDA可见设备和多进程策略
-6. **过拟合预防**：使用权重衰减、Dropout、LayerNorm等正则化手段
-
-## 常见问题
-### Q1: 提示找不到npy文件？
-A1: 检查`DATASET_OUTPUT_DIR`配置是否正确，确保已运行数据集构造脚本生成完整的npy文件。
-
-### Q2: CUDA out of memory（显存不足）？
-A2: 
-- 减小`BATCH_SIZE`（如从8改为4）
-- 增大`ACCUMULATION_STEPS`（保持等效批次）
-- 关闭其他占用GPU的程序
-- 降低`SAMPLE_LENGTH`（需重新生成数据集）
-
-### Q3: 训练准确率低/不收敛？
-A3:
-- 增大训练轮数（`EPOCHS`设50+）
-- 调整学习率（如将LR改为5e-4）
-- 确认`NUM_CLASSES`与实际类别数一致
-- 检查数据集是否存在标签错误或样本分布不均
-
-### Q4: 低版本PyTorch报错SiLU不存在？
-A4: 脚本已内置Swish类兼容低版本PyTorch，无需额外修改，自动切换激活函数。
-
-### Q5: 模型保存后加载失败？
-A5: 确保加载时的模型结构与训练时一致（尤其是`NUM_CLASSES`），加载代码示例：
+### 3. 启动训练
 ```python
-model = BIDE-V1_1D_Classifier(num_classes=20)
-checkpoint = torch.load("BIDE-V1_1d_best.pth")
-model.load_state_dict(checkpoint['model_state_dict'])
+if __name__ == "__main__":
+    torch.multiprocessing.freeze_support()  # Windows 必加，防止多进程报错
+    train_model()
 ```
+直接运行代码，训练过程会在控制台打印日志，并保存到 `train_logs/train_log.txt`。
+
+### 4. 结果查看
+- 日志文件：`train_logs/train_log.txt`（包含每轮训练/验证损失、准确率、资源占用）；
+- 模型文件：
+  - 最优模型：`modulation_dataset_50overlap/best_model.pth`；
+  - 检查点模型：`modulation_dataset_50overlap/epoch_5.pth`（每5轮保存）；
+- 关键指标：训练集/验证集/测试集的损失值、Top-1 准确率。
+
+## 五、常见问题与解决方案
+### 1. Windows 下报错 `BrokenPipeError`
+- 原因：`num_workers>0` 与内存映射（`mmap_mode='r'`）冲突；
+- 解决方案：保持 `num_workers=0`（代码已默认适配）。
+
+### 2. 显存溢出（`CUDA out of memory`）
+- 解决方案：
+  1. 减小 `BATCH_SIZE`（如从 64 改为 32）；
+  2. 增大 `ACCUMULATION_STEPS`（如从 4 改为 8）；
+  3. 降低 `MAX_GPU_MEM_RATIO`（如从 0.9 改为 0.8）；
+  4. 关闭其他占用 GPU 的程序。
+
+### 3. 数据集加载失败（`FileNotFoundError`）
+- 原因：数据集路径错误或文件缺失；
+- 解决方案：
+  1. 检查 `Config.DATASET_OUTPUT_DIR` 路径是否正确；
+  2. 确认目录下包含 `train_data.npy`、`train_labels.npy` 等文件；
+  3. 检查文件扩展名（需为 `.npy`，而非 `.npz` 或其他）。
+
+### 4. 类别数读取错误
+- 原因：`label_mapping.json` 格式错误；
+- 解决方案：
+  1. 确保 JSON 文件为标准字典格式；
+  2. 若文件缺失，代码会默认使用 20 类，需手动确认调制类别数并修改 `config.NUM_CLASSES`。
+
+### 5. 训练准确率为 0
+- 原因：
+  1. 标签与数据不匹配；
+  2. 学习率过高/过低；
+  3. 数据集样本长度不为 4096；
+- 解决方案：
+  1. 校验数据集形状（需为 [N,2,4096]）；
+  2. 调整学习率（如 3e-4 改为 1e-4）；
+  3. 检查标签是否正确映射到调制类型。
+
+## 六、扩展建议
+1. **数据增强**：在 `ModulationDataset.__getitem__` 中添加高斯噪声、相位偏移、幅度缩放等增强，提升模型泛化能力；
+2. **多GPU训练**：适配 `torch.nn.DataParallel` 或 `torch.distributed`，进一步提升训练速度；
+3. **模型轻量化**：减少卷积层通道数（如 512 改为 256），适配小显存环境；
+4. **学习率调优**：根据训练曲线调整 `OneCycleLR` 的 `pct_start` 参数，优化收敛速度。
+
+## 七、总结
+本代码针对 Float16 格式的调制信号数据集和 48G 内存/GPU 环境做了深度优化，核心解决了大规模数据集加载的内存占用问题、显存利用效率问题，同时保证了训练稳定性和模型性能。通过配置参数的灵活调整，可适配不同显存/内存规模的硬件环境，满足调制信号识别的训练需求。
