@@ -123,7 +123,7 @@ class ModulationDataset(Dataset):
             return torch.zeros(2, config.SAMPLE_LENGTH).float(), torch.tensor(0).long()
 
 
-# ===================== 模型定义 (YOLO12-1D) =====================
+# ===================== 模型定义 (BLDE-1D) =====================
 class Swish(nn.Module):
     def forward(self, x): return x * torch.sigmoid(x)
 
@@ -132,7 +132,7 @@ def get_activation():
     return nn.SiLU() if hasattr(nn, 'SiLU') else Swish()
 
 
-class YOLO12_1D_Modulation(nn.Module):
+class BLDE_1D_Modulation(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
 
@@ -236,7 +236,7 @@ def train_model():
                              num_workers=num_workers, pin_memory=True)
 
     # 3. 模型初始化
-    model = YOLO12_1D_Modulation(num_classes=config.NUM_CLASSES).to(device)
+    model = BLDE_1D_Modulation(num_classes=config.NUM_CLASSES).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.LR, weight_decay=config.WEIGHT_DECAY)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
