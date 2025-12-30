@@ -1,264 +1,394 @@
 import os
 import re
 import json
+import time
+import psutil
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import warnings
+import shutil
 
 warnings.filterwarnings('ignore')
 
 
-# ===================== 配置（仅修改此处） =====================
+# ===================== 配置（优化版） =====================
 class Config:
+    # 数据路径配置
     DATA_DIR = "../../DataSet"  # 原始.bin/.wav文件目录
-    DATASET_OUTPUT_DIR = "./modulation_dataset"  # 数据集输出目录
+    DATASET_OUTPUT_DIR = "./modulation_dataset_50overlap"  # 数据集输出目录
+
     SAMPLE_LENGTH = 4096  # 单样本IQ长度
+
+    # === 核心优化 1：步长设置 (50% 重叠) ===
+    # 步长 = 2048，即每次移动半个窗口，既增加了数据量又避免了过度膨胀
+    STRIDE = 2048
+
+    # === 核心优化 2：数据精度 ===
+    # 使用 float16 替代 float32，体积减半，显存占用减半
+    DTYPE = np.float16
+
+    # 流式分块配置
+    CHUNK_SIZE = 100000  # 每块样本数
 
     # 数据集划分
     TEST_SIZE = 0.1
     VAL_SIZE = 0.111
     RANDOM_STATE = 42
 
-    # 快速测试采样（跑通后注释）
-    # TRAIN_SAMPLE_LIMIT = 10000
-    # VAL_SAMPLE_LIMIT = 1000
-    # TEST_SAMPLE_LIMIT = 1000
+    # 打印/监控配置
+    PRINT_MEMORY_USAGE = True
+    PRINT_SAMPLE_DISTRIBUTION = True
 
 
 config = Config()
+
+# 创建目录
 os.makedirs(config.DATASET_OUTPUT_DIR, exist_ok=True)
+temp_chunk_dir = os.path.join(config.DATASET_OUTPUT_DIR, "temp_chunks")
+os.makedirs(temp_chunk_dir, exist_ok=True)
 
 
-# ===================== 核心函数：构造数据集 =====================
+# ===================== 辅助函数 =====================
+def print_memory_usage(step_name=""):
+    """打印当前内存占用"""
+    if not Config.PRINT_MEMORY_USAGE:
+        return
+    process = psutil.Process(os.getpid())
+    mem_usage = process.memory_info().rss / 1024 / 1024 / 1024  # GB
+    print(f"📊 内存占用 [{step_name}]：{mem_usage:.2f} GB")
+
+
+def print_sample_distribution(modulation_samples, label_encoder_mapping):
+    """打印各调制类型样本分布"""
+    if not Config.PRINT_SAMPLE_DISTRIBUTION:
+        return
+    print("\n" + "-" * 70)
+    print("📈 各调制类型样本分布汇总 (步长: {} | 50%重叠)".format(config.STRIDE))
+    print(f"{'调制类型':<12} {'样本总数':<15} {'标签ID':<8} {'文件数':<8}")
+    print("-" * 70)
+    total_all = 0
+    for mod, items in modulation_samples.items():
+        mod_total = sum([item['file_info']['estimated_samples'] for item in items])
+        total_all += mod_total
+        label_id = label_encoder_mapping.get(mod, -1)
+        file_count = len(items)
+        print(f"{mod:<12} {mod_total:<15,} {label_id:<8} {file_count:<8}")
+    print("-" * 70)
+    print(f"{'总计':<12} {total_all:<15,} {'-':<8} {len([i for v in modulation_samples.values() for i in v]):<8}")
+    print("-" * 70)
+
+
+# ===================== 核心函数：文件解析 =====================
 def get_file_iq_info(file_path):
-    """解析单个文件的IQ信息（复用你的逻辑）"""
+    """
+    解析单个文件的IQ基础信息，并根据步长估算样本数
+    """
     try:
-        if file_path.endswith('.bin'):
-            with open(file_path, 'rb') as f:
-                data = np.fromfile(f, dtype=np.int16)
-            total_iq = len(data) // 2
-            file_type = 'bin'
-            frame_size = 131072
-            total_frames = total_iq // frame_size
-            valid_iq = total_frames * frame_size
-            num_samples_per_file = sum([frame_size - config.SAMPLE_LENGTH + 1 for _ in range(total_frames)])
-
-        elif file_path.endswith('.wav'):
-            with open(file_path, 'rb') as f:
-                f.seek(1068)
-                data = np.fromfile(f, dtype=np.int16)
-            total_iq = len(data) // 2
-            file_type = 'wav'
-            valid_iq = total_iq
-            num_samples_per_file = total_iq - config.SAMPLE_LENGTH + 1 if total_iq >= config.SAMPLE_LENGTH else 0
-
-        else:
-            return None
-
         filename = os.path.basename(file_path)
+        file_ext = os.path.splitext(filename)[1].lower()
+        file_info = {
+            'file_path': file_path,
+            'filename': filename,
+            'file_type': file_ext[1:],  # bin/wav
+            'modulation': None,
+            'sample_rate_hz': None,
+            'total_iq_pairs': 0,
+            'valid_iq_pairs': 0,
+            'estimated_samples': 0,  # 根据步长计算的样本数
+            'frame_size': None,
+            'total_frames': None
+        }
+
+        # 提取调制类型
         name_without_ext = os.path.splitext(filename)[0]
-        modulation = name_without_ext.split('_')[0]
-        sample_rate_match = re.search(r'(\d+\.?\d*)\s*([kM]SPS)', name_without_ext)
+        modulation_part = name_without_ext.split('_', 1)[0].strip()
+        file_info['modulation'] = modulation_part
+
+        # 提取采样率
+        sample_rate_pattern = r'(\d+\.?\d*)\s*([kM]SPS)'
+        sample_rate_match = re.search(sample_rate_pattern, name_without_ext)
         if sample_rate_match:
             num = float(sample_rate_match.group(1))
             unit = sample_rate_match.group(2)
             sample_rate = num * 1e3 if unit == 'kSPS' else num * 1e6
-        else:
-            sample_rate = None
+            file_info['sample_rate_hz'] = sample_rate
 
-        return {
-            'file_path': file_path,
-            'filename': filename,
-            'file_type': file_type,
-            'modulation': modulation,
-            'sample_rate_hz': sample_rate,
-            'total_iq_pairs': total_iq,
-            'valid_iq_pairs': valid_iq,
-            'num_samples': num_samples_per_file,
-            'sample_length': config.SAMPLE_LENGTH,
-            'step': 1
-        }
+        # ========== BIN文件解析 ==========
+        if file_ext == '.bin':
+            frame_size_pattern = r'_(\d+)\.bin$'
+            frame_size_match = re.search(frame_size_pattern, filename)
+            if not frame_size_match:
+                return None
+
+            frame_size = int(frame_size_match.group(1))
+            file_info['frame_size'] = frame_size
+
+            # 仅仅读取元数据，不读取整个文件内容
+            file_size_bytes = os.path.getsize(file_path)
+            total_iq = file_size_bytes // 4  # int16 * 2 = 4 bytes
+
+            file_info['total_iq_pairs'] = total_iq
+            total_frames = total_iq // frame_size
+            file_info['total_frames'] = total_frames
+            file_info['valid_iq_pairs'] = total_frames * frame_size
+
+            # 计算样本数 (适配 Stride)
+            # 每帧的有效区间长度
+            valid_len_per_frame = frame_size - config.SAMPLE_LENGTH + 1
+            if valid_len_per_frame <= 0:
+                return None
+
+            # 每帧能切出的样本数 = (有效长度 / 步长) 向上取整
+            samples_per_frame = (valid_len_per_frame + config.STRIDE - 1) // config.STRIDE
+            file_info['estimated_samples'] = total_frames * samples_per_frame
+
+        # ========== WAV文件解析 ==========
+        elif file_ext == '.wav':
+            file_size = os.path.getsize(file_path)
+            # 跳过1068字节头，剩余字节 / 4 = IQ对数
+            valid_bytes = file_size - 1068
+            if valid_bytes <= 0: return None
+
+            total_iq = valid_bytes // 4
+            file_info['total_iq_pairs'] = total_iq
+            file_info['valid_iq_pairs'] = total_iq
+
+            # 计算样本数 (适配 Stride)
+            if total_iq < config.SAMPLE_LENGTH:
+                return None
+
+            valid_len = total_iq - config.SAMPLE_LENGTH + 1
+            # 样本数 = (有效长度 / 步长) 向上取整
+            file_info['estimated_samples'] = (valid_len + config.STRIDE - 1) // config.STRIDE
+
+        else:
+            return None
+
+        if file_info['estimated_samples'] <= 0:
+            return None
+
+        print(f"   └─ {filename} -> 预计生成样本: {file_info['estimated_samples']:,} (步长: {config.STRIDE})")
+        return file_info
+
     except Exception as e:
         print(f"⚠️  处理文件失败：{file_path} -> {str(e)}")
         return None
 
 
-def construct_dataset():
-    """主函数：生成元数据 + npy数据集"""
+def stream_read_sample(file_info, start_idx):
+    """
+    读取样本并转为 Float16
+    """
+    file_path = file_info['file_path'].replace('/', '\\')
+    if not os.path.exists(file_path):
+        file_path = os.path.join(config.DATA_DIR, os.path.basename(file_path))
+
+    if file_info['file_type'] == 'bin':
+        seek_pos = start_idx * 4
+    elif file_info['file_type'] == 'wav':
+        seek_pos = 1068 + start_idx * 4
+    else:
+        return np.zeros((config.SAMPLE_LENGTH, 2), dtype=config.DTYPE)
+
+    try:
+        with open(file_path, 'rb') as f:
+            f.seek(seek_pos)
+            data = np.fromfile(f, dtype=np.int16, count=config.SAMPLE_LENGTH * 2)
+    except Exception as e:
+        return np.zeros((config.SAMPLE_LENGTH, 2), dtype=config.DTYPE)
+
+    if len(data) < config.SAMPLE_LENGTH * 2:
+        sample = np.zeros((config.SAMPLE_LENGTH, 2), dtype=np.int16)
+        valid_len = len(data) // 2
+        sample[:valid_len] = data.reshape(-1, 2)
+    else:
+        sample = data.reshape(-1, 2)
+
+    # 归一化并转为 float16
+    sample_norm = sample.astype(config.DTYPE) / 32767.0
+    return sample_norm
+
+
+# ===================== 主函数 =====================
+def construct_dataset_stream():
+    total_start_time = time.time()
+
     print("=" * 80)
-    print("🚀 开始构造数据集（仅运行一次）")
+    print("🚀 开始流式构造调制信号数据集 (Float16 + 50% Overlap)")
+    print(f"⚙️  配置：样本长={config.SAMPLE_LENGTH} | 步长={config.STRIDE} | 精度={config.DTYPE.__name__}")
     print("=" * 80)
 
-    # 1. 生成全局样本映射
+    # 1. 统计文件
+    print("\n📌 第一步：解析文件信息...")
     all_file_metadata = []
-    global_sample_counter = 0
-    global_sample_mapping = []
+    modulation_samples = {}
+    total_samples_estimated = 0
 
     for filename in os.listdir(config.DATA_DIR):
         file_path = os.path.join(config.DATA_DIR, filename)
-        if not os.path.isfile(file_path):
-            continue
+        if not os.path.isfile(file_path): continue
 
         file_info = get_file_iq_info(file_path)
-        if not file_info or file_info['num_samples'] == 0:
-            continue
+        if not file_info: continue
 
         all_file_metadata.append(file_info)
+        mod = file_info['modulation']
+        if mod not in modulation_samples: modulation_samples[mod] = []
 
-        # 生成样本映射
-        if file_info['file_type'] == 'bin':
-            frame_size = 131072
-            frame_start = 0
-            for frame_idx in range(file_info['valid_iq_pairs'] // frame_size):
-                frame_samples = frame_size - config.SAMPLE_LENGTH + 1
-                for frame_inner_start in range(frame_samples):
-                    global_start = frame_start + frame_inner_start
-                    global_sample_mapping.append({
-                        'global_idx': global_sample_counter,
-                        'file_path': file_path,
-                        'start_iq_idx': global_start,
-                        'modulation': file_info['modulation']
-                    })
-                    global_sample_counter += 1
-                frame_start += frame_size
-        else:
-            for start_iq_idx in range(file_info['num_samples']):
-                global_sample_mapping.append({
-                    'global_idx': global_sample_counter,
-                    'file_path': file_path,
-                    'start_iq_idx': start_iq_idx,
-                    'modulation': file_info['modulation']
-                })
-                global_sample_counter += 1
+        modulation_samples[mod].append({'file_info': file_info})
+        total_samples_estimated += file_info['estimated_samples']
 
-        print(f"📄 处理完成：{filename} → {file_info['num_samples']}个样本")
-
-    # 保存元数据
-    pd.DataFrame(all_file_metadata).to_csv(
-        os.path.join(config.DATASET_OUTPUT_DIR, "file_metadata.csv"),
-        index=False, encoding='utf-8'
-    )
-    pd.DataFrame(global_sample_mapping).to_csv(
-        os.path.join(config.DATASET_OUTPUT_DIR, "global_sample_mapping.csv"),
-        index=False, encoding='utf-8'
-    )
-
-    # 生成标签映射
-    all_modulations = sorted(list(set([f['modulation'] for f in all_file_metadata])))
+    # 保存元数据和标签映射
+    all_modulations = sorted(list(modulation_samples.keys()))
     label_encoder_mapping = {mod: idx for idx, mod in enumerate(all_modulations)}
-    with open(os.path.join(config.DATASET_OUTPUT_DIR, "label_mapping.json"), 'w') as f:
-        json.dump({
-            'label_to_idx': label_encoder_mapping,
-            'idx_to_label': {v: k for k, v in label_encoder_mapping.items()},
-            'total_samples': global_sample_counter
-        }, f, indent=4)
 
-    # 2. 生成npy数据集
-    print("\n📌 开始生成npy数据集（训练全程用这个）")
-    mapping_df = pd.read_csv(os.path.join(config.DATASET_OUTPUT_DIR, "global_sample_mapping.csv"))
-    label_mapping = json.load(open(os.path.join(config.DATASET_OUTPUT_DIR, "label_mapping.json"), 'r'))
-    label_to_idx = label_mapping['label_to_idx']
-    total_samples = label_mapping['total_samples']
+    # 打印分布
+    print_sample_distribution(modulation_samples, label_encoder_mapping)
 
-    # 分层划分
-    X = np.arange(total_samples)
-    y = np.zeros(total_samples)
-    X_train_val, X_test, _, _ = train_test_split(
-        X, y, test_size=config.TEST_SIZE, random_state=config.RANDOM_STATE
-    )
-    X_train, X_val, _, _ = train_test_split(
-        X_train_val, y[:len(X_train_val)], test_size=config.VAL_SIZE, random_state=config.RANDOM_STATE
-    )
+    # 保存 Label Mapping
+    label_path = os.path.join(config.DATASET_OUTPUT_DIR, "label_mapping.json")
+    with open(label_path, 'w', encoding='utf-8') as f:
+        json.dump(label_encoder_mapping, f, ensure_ascii=False, indent=4)
 
-    # 采样限制
-    if hasattr(config, 'TRAIN_SAMPLE_LIMIT'):
-        X_train = X_train[:config.TRAIN_SAMPLE_LIMIT]
-    if hasattr(config, 'VAL_SAMPLE_LIMIT'):
-        X_val = X_val[:config.VAL_SAMPLE_LIMIT]
-    if hasattr(config, 'TEST_SAMPLE_LIMIT'):
-        X_test = X_test[:config.TEST_SAMPLE_LIMIT]
+    # 2. 生成索引并分块
+    print("\n📌 第二步：生成索引、划分并分块写入...")
+    chunk_counter = {'train': 0, 'val': 0, 'test': 0}
+    buffer = {
+        'train': {'data': [], 'labels': []},
+        'val': {'data': [], 'labels': []},
+        'test': {'data': [], 'labels': []}
+    }
 
-    # 读取单个样本
-    def read_sample(global_idx):
-        row = mapping_df.iloc[global_idx]
-        file_path = row['file_path'].replace('/', '\\')
-        if not os.path.exists(file_path):
-            file_path = os.path.join(config.DATA_DIR, os.path.basename(file_path))
+    for modulation in tqdm(all_modulations, desc="处理调制类型"):
+        mod_label = label_encoder_mapping[modulation]
+        mod_files = modulation_samples[modulation]
 
-        start_idx = int(row['start_iq_idx'])
-        modulation = row['modulation']
+        # 收集该调制类型下的所有样本索引
+        mod_all_samples = []
 
-        # 读取IQ数据
-        if file_path.endswith('.bin'):
-            with open(file_path, 'rb') as f:
-                f.seek(start_idx * 4)
-                data = np.fromfile(f, dtype=np.int16, count=config.SAMPLE_LENGTH * 2)
-        elif file_path.endswith('.wav'):
-            with open(file_path, 'rb') as f:
-                f.seek(1068 + start_idx * 4)
-                data = np.fromfile(f, dtype=np.int16, count=config.SAMPLE_LENGTH * 2)
-        else:
-            return np.zeros((config.SAMPLE_LENGTH, 2), dtype=np.float32), 0
+        for file_item in mod_files:
+            file_info = file_item['file_info']
 
-        # 处理数据
-        if len(data) < config.SAMPLE_LENGTH * 2:
-            sample = np.zeros((config.SAMPLE_LENGTH, 2), dtype=np.int16)
-            valid_len = len(data) // 2
-            sample[:valid_len] = data.reshape(-1, 2)
-        else:
-            sample = data.reshape(-1, 2)
-        sample_norm = sample.astype(np.float32) / 32767.0
-        label = label_to_idx.get(modulation, 0)
-        return sample_norm, label
+            if file_info['file_type'] == 'bin':
+                # BIN文件：按帧 + 步长 遍历
+                frame_size = file_info['frame_size']
+                total_frames = file_info['total_frames']
 
-    # 生成训练集
-    print("📌 生成训练集...")
-    train_data, train_labels = [], []
-    for idx in tqdm(X_train, desc="Train"):
-        data, label = read_sample(idx)
-        train_data.append(data)
-        train_labels.append(label)
-    train_data = np.array(train_data).transpose(0, 2, 1)
-    np.save(os.path.join(config.DATASET_OUTPUT_DIR, "train_data.npy"), train_data)
-    np.save(os.path.join(config.DATASET_OUTPUT_DIR, "train_labels.npy"), np.array(train_labels))
+                # 每一帧的有效起始点范围
+                max_start_in_frame = frame_size - config.SAMPLE_LENGTH + 1
 
-    # 生成验证集
-    print("📌 生成验证集...")
-    val_data, val_labels = [], []
-    for idx in tqdm(X_val, desc="Val"):
-        data, label = read_sample(idx)
-        val_data.append(data)
-        val_labels.append(label)
-    val_data = np.array(val_data).transpose(0, 2, 1)
-    np.save(os.path.join(config.DATASET_OUTPUT_DIR, "val_data.npy"), val_data)
-    np.save(os.path.join(config.DATASET_OUTPUT_DIR, "val_labels.npy"), np.array(val_labels))
+                frame_start_addr = 0
+                for _ in range(total_frames):
+                    # 在帧内应用步长
+                    for inner_start in range(0, max_start_in_frame, config.STRIDE):
+                        global_start = frame_start_addr + inner_start
+                        mod_all_samples.append((file_info, global_start))
+                    frame_start_addr += frame_size
 
-    # 生成测试集
-    print("📌 生成测试集...")
-    test_data, test_labels = [], []
-    for idx in tqdm(X_test, desc="Test"):
-        data, label = read_sample(idx)
-        test_data.append(data)
-        test_labels.append(label)
-    test_data = np.array(test_data).transpose(0, 2, 1)
-    np.save(os.path.join(config.DATASET_OUTPUT_DIR, "test_data.npy"), test_data)
-    np.save(os.path.join(config.DATASET_OUTPUT_DIR, "test_labels.npy"), np.array(test_labels))
+            else:
+                # WAV文件：全程应用步长
+                max_start = file_info['valid_iq_pairs'] - config.SAMPLE_LENGTH + 1
+                for start_idx in range(0, max_start, config.STRIDE):
+                    mod_all_samples.append((file_info, start_idx))
 
-    # 完成提示
+        # 划分数据集 (Train/Val/Test)
+        if len(mod_all_samples) == 0: continue
+
+        X_train_val, X_test = train_test_split(mod_all_samples, test_size=config.TEST_SIZE,
+                                               random_state=config.RANDOM_STATE)
+        X_train, X_val = train_test_split(X_train_val, test_size=config.VAL_SIZE, random_state=config.RANDOM_STATE)
+
+        # 定义写入函数
+        def process_split(sample_list, split_name):
+            for item in sample_list:
+                f_info, s_idx = item
+                data = stream_read_sample(f_info, s_idx)
+
+                buffer[split_name]['data'].append(data)
+                buffer[split_name]['labels'].append(mod_label)
+
+                # 缓冲区满 -> 写入
+                if len(buffer[split_name]['data']) >= config.CHUNK_SIZE:
+                    save_chunk(split_name)
+
+        def save_chunk(split_name):
+            data_arr = np.array(buffer[split_name]['data']).transpose(0, 2, 1)  # (N, 2, L)
+            label_arr = np.array(buffer[split_name]['labels'])
+
+            c_idx = chunk_counter[split_name]
+            path = os.path.join(temp_chunk_dir, f"{split_name}_chunk_{c_idx}.npz")
+
+            # 使用压缩保存以进一步减小体积
+            np.savez_compressed(path, data=data_arr, labels=label_arr)
+
+            buffer[split_name]['data'] = []
+            buffer[split_name]['labels'] = []
+            chunk_counter[split_name] += 1
+            print_memory_usage(f"{split_name}_chunk_{c_idx}")
+
+        # 执行写入
+        process_split(X_train, 'train')
+        process_split(X_val, 'val')
+        process_split(X_test, 'test')
+
+    # 3. 写入剩余数据
+    print("\n📌 第三步：清理缓冲区...")
+    for split in ['train', 'val', 'test']:
+        if len(buffer[split]['data']) > 0:
+            save_chunk(split)
+
+    # 4. 合并分块 (修复了 Windows PermissionError 问题)
+    print("\n📌 第四步：合并最终文件...")
+    for split in ['train', 'val', 'test']:
+        all_data = []
+        all_labels = []
+        count = chunk_counter[split]
+
+        if count == 0: continue
+
+        print(f"合并 {split} 集 ({count} 个分块)...")
+        for i in tqdm(range(count)):
+            p = os.path.join(temp_chunk_dir, f"{split}_chunk_{i}.npz")
+            if os.path.exists(p):
+                # ================= 关键修复 =================
+                # 使用 with 上下文管理器，确保加载完自动关闭文件句柄
+                try:
+                    with np.load(p) as loaded:
+                        all_data.append(loaded['data'])
+                        all_labels.append(loaded['labels'])
+
+                    # 此时文件已关闭，可以安全删除
+                    os.remove(p)
+                except Exception as e:
+                    print(f"⚠️  警告：无法删除临时文件 {p} -> {e}")
+                # ===========================================
+
+        if all_data:
+            final_data = np.concatenate(all_data, axis=0)
+            final_labels = np.concatenate(all_labels, axis=0)
+
+            # 保存最终文件
+            np.save(os.path.join(config.DATASET_OUTPUT_DIR, f"{split}_data.npy"), final_data)
+            np.save(os.path.join(config.DATASET_OUTPUT_DIR, f"{split}_labels.npy"), final_labels)
+
+            data_size = final_data.nbytes / 1024 / 1024 / 1024
+            print(f"✅ {split} 保存完成: 样本数 {len(final_data):,} | 大小 {data_size:.2f} GB")
+
+    # 删除临时目录
+    try:
+        if os.path.exists(temp_chunk_dir):
+            shutil.rmtree(temp_chunk_dir)  # 强力删除整个文件夹
+    except Exception as e:
+        print(f"⚠️  清理临时目录失败: {e}")
+
     print("\n" + "=" * 80)
-    print("🎉 数据集构造完成！生成的文件：")
-    file_list = [
-        "file_metadata.csv", "global_sample_mapping.csv", "label_mapping.json",
-        "train_data.npy", "train_labels.npy", "val_data.npy", "val_labels.npy", "test_data.npy", "test_labels.npy"
-    ]
-    for f in file_list:
-        print(f"  - {os.path.join(config.DATASET_OUTPUT_DIR, f)}")
-    print("✅ 接下来运行trainer.py训练，全程不碰原始文件！")
+    print(f"🎉 处理完成！输出目录：{config.DATASET_OUTPUT_DIR}")
+    print(f"🚀 最终步长：{config.STRIDE} (50% Overlap)")
+    print(f"💾 数据类型：{config.DTYPE.__name__} (Float16)")
     print("=" * 80)
 
 
-# ===================== 运行入口 =====================
 if __name__ == "__main__":
-    construct_dataset()
+    construct_dataset_stream()
