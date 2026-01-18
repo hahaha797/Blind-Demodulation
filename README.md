@@ -356,3 +356,90 @@ if __name__ == "__main__":
 
 ## 七、总结
 本代码针对 Float16 格式的调制信号数据集和 48G 内存/GPU 环境做了深度优化，核心解决了大规模数据集加载的内存占用问题、显存利用效率问题，同时保证了训练稳定性和模型性能。通过配置参数的灵活调整，可适配不同显存/内存规模的硬件环境，满足调制信号识别的训练需求。
+
+graph TD
+    %% 定义样式
+    classDef input fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef embed fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+    classDef concat fill:#ffe0b2,stroke:#f57c00,stroke-width:2px;
+    classDef block fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef se fill:#f3e5f5,stroke:#7b1fa2,stroke-width:1px,stroke-dasharray: 5 5;
+    classDef pool fill:#e0f7fa,stroke:#006064,stroke-width:2px;
+    classDef dense fill:#fce4ec,stroke:#880e4f,stroke-width:2px;
+
+    %% 1. 输入层
+    In[Input I/Q Signal<br/>(Batch, 2, 4096)]:::input --> Split
+
+    %% 2. 多域特征嵌入 (Multi-Domain Embedding)
+    subgraph Embedding_Layer [Multi-Domain Embedding Layer]
+        direction TB
+        Split((Split)) --> Branch1[Time Domain<br/>Pass Through]
+        Split --> Branch2[Freq Domain<br/>FFT -> Abs -> Log1p]
+        Split --> Branch3[Time-Freq Domain<br/>Haar Wavelet Conv]
+        
+        Branch1 -- 2 Channels --> Concat
+        Branch2 -- 1 Channel --> Concat
+        Branch3 -- 4 Channels --> Concat
+        
+        Concat[Concatenate<br/>(Batch, 7, 4096)]:::concat
+    end
+
+    %% 3. 特征提取骨干 (Backbone)
+    subgraph Backbone [Feature Extractor with SE-Blocks]
+        direction TB
+        Concat --> S1
+        
+        subgraph Stage1 [Stage 1]
+            S1[Conv1d (k=7, s=2)<br/>BN + SiLU]:::block
+            SE1(SE-Block r=4):::se
+            S1 --> SE1
+        end
+        
+        SE1 --> S2_In
+        
+        subgraph Stage2 [Stage 2]
+            S2_In[Conv1d (k=5, s=2)<br/>BN + SiLU]:::block
+            SE2(SE-Block r=8):::se
+            Drop1[Dropout 0.1]
+            S2_In --> SE2 --> Drop1
+        end
+
+        Drop1 --> S3_In
+        
+        subgraph Stage3 [Stage 3]
+            S3_In[Conv1d (k=3, s=2)<br/>BN + SiLU]:::block
+            SE3(SE-Block r=16):::se
+            S3_In --> SE3
+        end
+
+        SE3 --> S4_In
+        
+        subgraph Stage4 [Stage 4]
+            S4_In[Conv1d (k=3, s=2)<br/>BN + SiLU]:::block
+            SE4(SE-Block r=16):::se
+            S4_In --> SE4
+        end
+
+        SE4 --> S5_In
+        
+        subgraph Stage5 [Stage 5]
+            S5_In[Conv1d (k=3, s=2)<br/>BN + SiLU]:::block
+            SE5(SE-Block r=16):::se
+            S5_In --> SE5
+        end
+
+        SE5 --> S6_In
+
+        subgraph Stage6 [Stage 6]
+            S6_In[Conv1d (k=3, s=2)<br/>BN + SiLU]:::block
+            SE6(SE-Block r=16):::se
+            S6_In --> SE6
+        end
+    end
+
+    %% 4. 分类头 (Classifier Head)
+    SE6 -- (Batch, 512, 64) --> Pool[Adaptive AvgPool1d<br/>(Global Pooling)]:::pool
+    Pool -- (Batch, 512, 1) --> Flat[Flatten]:::dense
+    Flat -- (Batch, 512) --> FC1[Linear 512->256<br/>LayerNorm + SiLU + Drop]:::dense
+    FC1 -- (Batch, 256) --> FC2[Linear 256->Num_Classes]:::dense
+    FC2 --> Out[Output Probabilities]:::input
