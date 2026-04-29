@@ -1,6 +1,27 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
+# ===================== 0. 字体配置函数 (新增) =====================
+def setup_font():
+    # 核心字体配置：英文/数字用Times New Roman，中文用宋体，跨系统兼容
+    plt.rcParams['font.family'] = 'serif'
+    plt.rcParams['font.serif'] = [
+        'Times New Roman',
+        'SimSun',
+        'Songti SC',
+        'DejaVu Serif'
+    ]
+    plt.rcParams['axes.unicode_minus'] = False
+
+    # 完全保留你的字号设置
+    plt.rcParams['axes.titlesize'] = 26
+    plt.rcParams['axes.labelsize'] = 26
+    plt.rcParams['xtick.labelsize'] = 26
+    plt.rcParams['ytick.labelsize'] = 26
+    plt.rcParams['legend.fontsize'] = 22
+    plt.rcParams['figure.titlesize'] = 22
+
+    print("✅ Font initialized: English=Times New Roman, Chinese=SimSun")
 
 # ===================== 1. 模拟信号生成函数 =====================
 def generate_baseband_signal(mod_type, num_symbols=10000):
@@ -55,8 +76,7 @@ def generate_baseband_signal(mod_type, num_symbols=10000):
     iq = iq / np.sqrt(np.mean(np.abs(iq) ** 2))
     return np.vstack([np.real(iq), np.imag(iq)])
 
-
-# ===================== 2. 加噪函数 (引用你代码中的逻辑) =====================
+# ===================== 2. 加噪函数 =====================
 def add_awgn(signal, snr_db):
     signal_power = np.mean(np.sum(signal ** 2, axis=0))
     noise_power = signal_power / (10 ** (snr_db / 10.0))
@@ -64,9 +84,11 @@ def add_awgn(signal, snr_db):
     noise = np.random.normal(0, noise_std, size=signal.shape)
     return signal + noise
 
-
 # ===================== 3. 绘图主程序 =====================
 def plot_modulation_constellations(snr_list=[30, 15, 5]):
+    # 🔴 在这里调用字体设置，确保绘图前生效
+    setup_font()
+
     mod_list = [
         'BPSK', 'QPSK', '8PSK', 'OQPSK', 'PI/4DQPSK',
         '16QAM', '32QAM', '64QAM', '128QAM', '256QAM',
@@ -91,22 +113,21 @@ def plot_modulation_constellations(snr_list=[30, 15, 5]):
 
             ax = axes[m_idx, s_idx]
             ax.scatter(noisy_signal[0], noisy_signal[1], s=1, alpha=0.6, color='blue')
-            ax.set_title(f"{mod_type} @ {snr}dB", fontsize=10)
-            ax.set_xlim([-4, 4]);
+            ax.set_title(f"{mod_type} @ {snr}dB", fontsize=26)
+            ax.set_xlim([-4, 4])
             ax.set_ylim([-4, 4])
             ax.grid(True, linestyle=':', alpha=0.5)
             ax.set_aspect('equal')
 
-            if m_idx == num_mods - 1: ax.set_xlabel("In-Phase")
-            if s_idx == 0: ax.set_ylabel("Quadrature")
+            if m_idx == num_mods - 1:
+                ax.set_xlabel("In-Phase")
+            if s_idx == 0:
+                ax.set_ylabel("Quadrature")
 
     plt.suptitle("", fontsize=16, y=0.99)
-    # 在绘图脚本的 plt.show() 之前添加：
+    # 调整布局
     plt.tight_layout(pad=0.4, w_pad=0.5, h_pad=1.0)
-    # pad: 整体边缘间距
-    # w_pad/h_pad: 子图之间的宽度和高度间距
     plt.show()
-
 
 if __name__ == "__main__":
     plot_modulation_constellations(snr_list=[30, 20, 10, 5])

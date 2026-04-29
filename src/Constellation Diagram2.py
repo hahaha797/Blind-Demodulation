@@ -4,6 +4,29 @@ import scipy.signal as signal
 from scipy.fftpack import fftshift
 
 
+# ===================== 0. 字体配置函数 (新增) =====================
+def setup_font():
+    # 核心字体配置：英文/数字用Times New Roman，中文用宋体，跨系统兼容
+    plt.rcParams['font.family'] = 'serif'
+    plt.rcParams['font.serif'] = [
+        'Times New Roman',
+        'SimSun',
+        'Songti SC',
+        'DejaVu Serif'
+    ]
+    plt.rcParams['axes.unicode_minus'] = False
+
+    # 完全保留你的字号设置
+    plt.rcParams['axes.titlesize'] = 10
+    plt.rcParams['axes.labelsize'] = 26
+    plt.rcParams['xtick.labelsize'] = 26
+    plt.rcParams['ytick.labelsize'] = 26
+    plt.rcParams['legend.fontsize'] = 22
+    plt.rcParams['figure.titlesize'] = 22
+
+    print("✅ Font initialized: English=Times New Roman, Chinese=SimSun")
+
+
 # ===================== 1. 信号生成引擎 (增强物理特性) =====================
 def generate_signal(mod_type, num_samples=4096, sps=8):
     """
@@ -81,6 +104,9 @@ def add_noise(iq, snr_db):
 
 # ===================== 3. 增强版绘图函数 =====================
 def plot_modulation_analysis(mod_list, snr=20):
+    # 调用字体配置函数，确保绘图前生效
+    setup_font()
+
     num_mods = len(mod_list)
     fig, axes = plt.subplots(num_mods, 3, figsize=(10, 2.2 * num_mods))
 
@@ -94,18 +120,18 @@ def plot_modulation_analysis(mod_list, snr=20):
         # --- 列 1: 星座图 (增加范围限制，隐藏刻度) ---
         ax_const = axes[i, 0]
         ax_const.scatter(np.real(noisy_iq), np.imag(noisy_iq), s=0.8, alpha=0.4, color='navy')
-        ax_const.set_title(f"{mod}", fontsize=10, fontweight='bold', pad=2)
-        ax_const.set_xlim([-3.2, 3.2]);
+        ax_const.set_title(f"{mod}", fontsize=28, fontweight='bold', pad=2)
+        ax_const.set_xlim([-3.2, 3.2])
         ax_const.set_ylim([-3.2, 3.2])
-        ax_const.set_xticks([]);
+        ax_const.set_xticks([])
         ax_const.set_yticks([])
         ax_const.set_aspect('equal')
 
         # --- 列 2: 时域波形 (I路) ---
         ax_time = axes[i, 1]
         ax_time.plot(np.real(noisy_iq[:256]), linewidth=0.7, color='seagreen')
-        ax_time.set_title("Time (I)", fontsize=9, pad=2)
-        ax_time.set_xticks([]);
+        ax_time.set_title("Time (I)", fontsize=28, pad=2)
+        ax_time.set_xticks([])
         ax_time.set_yticks([])
 
         # --- 列 3: 功率谱密度 (PSD) - 修正横线问题 ---
@@ -114,11 +140,11 @@ def plot_modulation_analysis(mod_list, snr=20):
         f, Pxx = signal.welch(noisy_iq, fs=1.0, nperseg=512, detrend=False)
         # 修正：使用fftshift对齐频率中心，并确保绘图数据不交叉
         ax_psd.semilogy(fftshift(f), fftshift(Pxx), color='crimson', linewidth=0.9)
-        ax_psd.set_title("Spectrum (PSD)", fontsize=9, pad=2)
-        ax_psd.set_xticks([]);
+        ax_psd.set_title("Spectrum (PSD)", fontsize=28, pad=2)
+        ax_psd.set_xticks([])
         ax_psd.set_yticks([])
 
-    plt.suptitle(f"Modulation Feature Analysis (SNR={snr}dB)", fontsize=14, y=0.99)
+    plt.suptitle(f"Modulation Feature Analysis (SNR={snr}dB)", fontsize=28, y=0.99)
     # 强制紧凑布局
     fig.tight_layout(rect=[0, 0.03, 1, 0.97])
     plt.show()
